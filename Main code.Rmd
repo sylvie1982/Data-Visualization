@@ -1,0 +1,874 @@
+---
+title: "Final_Project_Code"
+author: "Group 9"
+date: "2023-12-18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+## Import Library
+library(GGally)
+library(lares)
+library(reshape2)
+library(naniar)
+library(visdat)
+library(stringr)
+library(ggplot2)
+library(rpart)
+library(dplyr)
+library(mice)
+library(fastDummies)
+library(tibble)
+library(patchwork)
+library(tidyr)
+library(glue)
+library(xgboost)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(tree)
+```
+
+```{r}
+## Data importing and setting all empty space as NA
+
+train.raw <- read.csv("train.csv", na.strings=c("", "NA"), sep=",", header = TRUE)
+test <- read.csv("test.csv", na.strings=c("", "NA"), sep=",", header = TRUE)
+
+```
+
+```{r}
+## Data Overview
+
+head(train.raw)
+summary(train.raw)
+
+```
+
+
+```{r,fig.width=15}
+## Missing Value Analysis
+
+sum(is.na(train.raw))
+vis_miss(train.raw)
+gg_miss_upset(train.raw)
+gg_miss_var(train.raw)
+
+#setEPS()
+#postscript("MissingValuePorprotion.eps")
+#vis_miss(train.raw)
+#dev.off()
+
+#setEPS()
+#postscript("MissingValueInteraction.eps", horizontal = FALSE, onefile = FALSE, paper = "special")
+#gg_miss_upset(train.raw)
+#dev.off()
+
+#setEPS()
+#postscript("MissingValueInteraction.eps")
+#gg_miss_var(train.raw)
+#dev.off()
+
+```
+
+```{r}
+###################
+## Preprocessing ##
+###################
+
+##處理類別
+
+train.raw <- data.frame(train.raw)
+## split passengerId
+train.raw$ID <- as.numeric(str_split_fixed(train.raw$PassengerId, "_" ,2)[,1])
+cabin <- data.frame(str_split_fixed(train.raw$Cabin, "/", 3))
+cabin <- replace(cabin, cabin=="", NA)
+colnames(cabin)[1] <- "CabinDeck"
+colnames(cabin)[2] <- "CabinNum"
+colnames(cabin)[3] <- "CabinSide"
+cabin[,2] <- as.integer(cabin[,2])
+train.raw <- cbind(train.raw, cabin)
+train.raw <- train.raw[, c(1,15,2:3,16:18,5:14)]
+
+## deal with categorical data
+
+train <- train.raw %>%
+  group_by(train.raw$PassengerId) %>%
+  mutate(
+    HomePlanet = ifelse(is.na(HomePlanet), na.omit(HomePlanet)[1], HomePlanet),
+    CryoSleep = ifelse(is.na(CryoSleep), na.omit(CryoSleep)[1], CryoSleep),
+    CabinDeck = ifelse(is.na(CabinDeck), na.omit(CabinDeck)[1], CabinDeck),
+    CabinNum = ifelse(is.na(CabinNum), na.omit(CabinNum)[1], CabinNum),
+    CabinSide = ifelse(is.na(CabinSide), na.omit(CabinSide)[1], CabinSide),
+    Destination = ifelse(is.na(Destination), na.omit(Destination)[1], Destination),
+    VIP = ifelse(is.na(VIP), na.omit(VIP)[1], VIP)
+  ) %>%
+  ungroup()
+
+## only one person in a group, random the value
+
+set.seed(1)
+train_random <- train %>%
+  mutate(
+    HomePlanet = ifelse(is.na(HomePlanet), sample(na.omit(HomePlanet), 1), HomePlanet),
+    CryoSleep = ifelse(is.na(CryoSleep), sample(na.omit(CryoSleep), 1), CryoSleep),
+    CabinDeck = ifelse(is.na(CabinDeck), sample(na.omit(CabinDeck), 1), CabinDeck),
+    CabinSide = ifelse(is.na(CabinSide), sample(na.omit(CabinSide), 1), CabinSide),
+    Destination = ifelse(is.na(Destination),sample(na.omit(Destination), 1), Destination),
+    VIP = ifelse(is.na(VIP), sample(na.omit(VIP), 1), VIP)
+  )
+
+```
+
+
+```{r}
+##處理數據型
+
+mice.data <- mice(train_random, m = 2, maxit = 50, method = "cart")
+
+sum(is.na(mice.data))
+df <- complete(mice.data, 1)
+
+```
+
+
+
+```{r}
+## Create dummy variables
+
+df$CryoSleep = as.integer(factor(train_random$CryoSleep)) - 1
+df$VIP = as.integer(factor(train_random$VIP)) - 1
+df$Transported = as.integer(factor(train_random$Transported)) - 1
+df <- dummy_cols(df, select_columns = 'HomePlanet')
+df <- dummy_cols(df, select_columns = 'CabinSide')
+df <- dummy_cols(df, select_columns = 'CabinDeck')
+df <- dummy_cols(df, select_columns = 'Destination')
+
+## Delete irrelevant variable 
+df <- subset(df, select = c(-Name))
+df <- df[, c(16,1:15,18:33)]
+# write.csv(df, "preprocess_train.csv", row.names = FALSE) 
+
+```
+
+```{r}
+## Overview After Cleaning
+
+head(df)
+summary(df)
+
+```
+
+```{r}
+## EDA
+
+set.seed(1) 
+
+index <- sample(1:nrow(df),ceiling(0.8*nrow(df)))
+training <- df[index,]
+testing <- df[-index,]
+
+write.csv(training, "training.csv", row.names = FALSE) 
+write.csv(testing, "testing.csv", row.names = FALSE) 
+```
+
+```{r}
+numeric_cols <- sapply(df, is.numeric)
+df_numerical <- df[, numeric_cols]
+head(df_numerical)
+summary(df_numerical)
+```
+
+```{r, fig.width=20, fig.height=20, message=FALSE, warning=FALSE}
+## Correlation Plot
+
+cor_df <- round(cor(df_numerical), 2)
+melted_cor <- melt(cor_df)
+ggplot(data = melted_cor, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile() +
+  geom_text(aes(Var2, Var1, label = value), size = 5) +
+  scale_fill_gradient2(mid="#FBFEF9",low="#0C6291",high="#A63446",
+                       limit = c(-1,1), name="Correlation") +
+  theme(axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        panel.background = element_blank())
+
+ggpairs(df_numerical)
+df_numerical %>% corr_var(Transported)
+
+#setEPS()
+#postscript("CorrelationsPlot.eps")
+#ggpairs(df_numerical)
+#dev.off()
+
+#setEPS()
+#postscript("CorrelationsOfTransported.eps")
+#df_numerical %>% corr_var(Transported)
+#dev.off()
+
+
+```
+
+```{r}
+## Univariate Analysis
+df_numerical %>% distr(Transported,CryoSleep)
+df_numerical %>% distr(Transported,VIP)
+df %>% distr(Transported,HomePlanet)
+df %>% distr(Transported,CabinDeck)
+df %>% distr(Transported,CabinSide)
+df %>% distr(Transported,Destination)
+
+df_numerical %>% distr(Age)
+df_numerical %>% filter(FoodCourt < 300) %>% distr(FoodCourt)
+df_numerical %>% filter(RoomService < 500) %>% distr(RoomService)
+df_numerical %>% filter(Spa < 300) %>% distr(Spa)
+df_numerical %>% filter(VRDeck < 300) %>% distr(VRDeck)
+df_numerical %>% filter(ShoppingMall < 300) %>% distr(ShoppingMall)
+df %>% distr(CabinNum)
+
+```
+
+
+```{r, fig.width=20, fig.height=15}
+## Bar plot
+
+p1 <- ggplot(df, aes(x=as.character(Transported))) +
+   xlab('Transported')+ 
+  geom_bar()
+p1
+
+p2 <- ggplot(df, aes(x=HomePlanet)) + 
+  geom_bar()
+
+p2
+
+p3 <- ggplot(df, aes(x=as.character(CryoSleep))) +
+   xlab('CryoSleep')+ 
+  geom_bar()
+p3
+
+p4 <- ggplot(df, aes(x=CabinDeck)) + 
+  geom_bar()
+p4
+
+p5 <- ggplot(df, aes(x=CabinSide)) + 
+  geom_bar()
+p5
+
+p6 <- ggplot(df, aes(x=Destination)) + 
+  geom_bar()
+p6
+
+p7 <- ggplot(df, aes(x=as.character(VIP))) +
+   xlab('VIP')+ 
+  geom_bar()
+p7
+
+```
+
+```{r, fig.width=20, fig.height=15}
+## Histogram
+
+p2 <- ggplot(df, aes(x=HomePlanet, fill = as.character(Transported)))  +
+  scale_colour_manual(name = "Transported")+ 
+  geom_bar(position = "fill")
+p2
+
+p3 <- ggplot(df, aes(x=as.character(CryoSleep), fill = as.character(Transported)))+
+  scale_colour_manual(name = "Transported") + 
+  geom_bar(position = "fill")
+p3
+
+p4 <- ggplot(df, aes(x=CabinDeck,fill = as.character(Transported)))+
+  xlab('CabinDeck') +
+  scale_colour_manual(name = "Transported")+ 
+  geom_bar(position = "fill")
+p4
+
+p5 <- ggplot(df, aes(x=CabinSide,fill = as.character(Transported))) +
+  scale_colour_manual(name = "Transported")+ 
+  geom_bar(position = "fill")
+p5
+
+p6 <- ggplot(df, aes(x=Destination,fill = as.character(Transported))) +
+  scale_colour_manual(name = "Transported")+ 
+  geom_bar(position = "fill")
+p6
+
+p7 <- ggplot(df, aes(x=as.character(VIP),fill = as.character(Transported))) +
+  xlab('VIP')+
+  scale_colour_manual(name = "Transported")+ 
+  geom_bar(position = "fill")
+p7
+
+```
+
+```{r, fig.width=20, fig.height=15}
+## Histogram of numerical data
+
+p8 <- ggplot(df, aes(x = CabinNum)) +
+  geom_histogram(aes(y = ..density..),
+                 colour = 1, fill = "white") +
+  geom_density(lwd = 1, colour = 4,
+               fill = 4, alpha = 0.25)
+p8
+
+p9 <- ggplot(df, aes(x = Age)) +
+  geom_histogram(aes(y = ..density..),
+                 colour = 1, fill = "white") +
+  geom_density(lwd = 1, colour = 4,
+               fill = 4, alpha = 0.25)
+p9
+
+p11 <- ggplot(df, aes(x = FoodCourt)) +
+  geom_histogram(aes(y = ..density..),
+                 colour = 1, fill = "white") 
+p11
+
+p12 <- ggplot(df, aes(x = ShoppingMall)) +
+  geom_histogram(aes(y = ..density..),
+              colour = 1, fill = "white") 
+p12
+
+p13 <- ggplot(df, aes(x = Spa))+
+  geom_histogram(bins = 30,aes(y = ..density..),
+                 colour = 1, fill = "white") 
+p13
+
+p14 <- ggplot(df, aes(x = VRDeck)) +
+  geom_histogram(aes(y = ..density..),
+                 colour = 1, fill = "white")
+p14
+
+p15 <- ggplot(df, aes(x = RoomService)) +
+  geom_histogram(aes(y = ..density..),
+                 colour = 1, fill = "white")
+p15
+
+```
+
+```{r}
+#不同KNN效果(找出最佳K值)
+K.collector <- rep(NA, 200)
+for (k.try in 1:200){
+  knn.pred <-  knn(train, test, train$Transported, k = k.try)
+  K.collector[k.try] <- mean(knn.pred != test$Transported)
+}
+x.k <- c(1:200)
+
+plot(x.k,K.collector, type="o", pch=19, cex=0.5, main="K ")
+which.min(K.collector)
+
+#KNN準確率評估(使用accuarcy)
+a=proc.time()
+test_pred <- knn(train = train, 
+                 test = test,
+                 cl = train$Transported, 
+                 k=which.min(K.collector))
+b=proc.time()
+print(b-a)
+
+actual <- test$Transported
+cm <- table(actual,test_pred)
+cm
+
+accuracy <- sum(diag(cm))/length(actual)
+sprintf("Accuracy: %.2f%%", accuracy*100)
+
+
+#MSE計算
+test$Transported_mse <- as.numeric(as.character(test$Transported))
+test_pred_mse <- as.numeric(as.character(test_pred))
+mse = mean((test_lasso$Transported_mse - test_pred_mse)^2)
+mse
+```
+
+
+```{r}
+########
+##CART##
+########
+train <- training
+test <- testing
+train <- train[,-c(2,4,6,8,9)]
+test <- test[,-c(2,4,6,8,9)]
+```
+
+```{r}
+library(rpart)
+library(rpart.plot)
+library(tree)
+library(dplyr)
+```
+
+```{r}
+tree2 <- tree(Transported ~., data = train)
+
+# setEPS()
+# postscript("tree1.eps")
+plot(tree2) ;  text(tree2,pretty=0, cex=0.7)
+# dev.off()
+```
+
+```{r}
+pred = predict(tree2,test) 
+mean((pred - test$Transported)^2)
+pred = pred > 0.5
+for (i in 1:length(pred)) {
+  if (pred[i] == T){
+    pred[i] = 1
+  }else{
+    pred[i] = 0
+  }
+}
+table(pred, test$Transported)
+mean(pred == test$Transported)
+```
+
+
+```{r}
+# prune tree
+set.seed(20)
+cv_tree = cv.tree(tree2, FUN = prune.tree)
+# cv_tree
+# setEPS()
+# postscript("treecv.eps", height = 5)
+plot(cv_tree$size, cv_tree$dev,type="b")
+points(cv_tree$size[which.min(cv_tree$dev)],min(cv_tree$dev), col="blue", pch=20,cex=1.5)
+# dev.off()
+```
+
+
+```{r}
+prune_tree = prune.tree(tree2,best = cv_tree$size[which.min(cv_tree$dev)])
+
+# setEPS()
+# postscript("tree2.eps", height = 5)
+plot(tree2) ;  text(tree2,pretty=0, cex=0.7);title("tree")
+# dev.off()
+# setEPS()
+# postscript("prunetree.eps", height = 5)
+plot(prune_tree) ; text(prune_tree,pretty=0, cex = 0.7);title("prune_tree")
+# dev.off()
+```
+
+
+```{r}
+pred2 = predict(prune_tree,newdata = test)
+mean((pred2 - test$Transported)^2)
+
+fit_tree = pred2 > 0.5
+for (i in 1:length(fit_tree)) {
+  if (fit_tree[i] == T){
+    fit_tree[i] = 1
+  }else{
+    fit_tree[i] = 0
+  }
+}
+table(fit_tree, test$Transported)
+mean(fit_tree == test$Transported)
+
+```
+
+```{r}
+tree1 = rpart(Transported~., data = train)
+
+
+predd = predict(tree1, test)
+
+pruner = prune(tree1, cp = tree1$cptable[which.min(tree1$cptable[,"xerror"]),"CP"])
+
+predd2 = predict(pruner, test)
+
+predd2 = predd2 > 0.5
+for (i in 1:length(predd2)) {
+  if (predd2[i] == T){
+    predd2[i] = 1
+  }else{
+    predd2[i] = 0
+  }
+}
+
+
+pruner$variable.importance
+# setEPS()
+# postscript("varimp.eps", height = 5)
+par(mar = c(5,7,4,2))
+barplot(pruner$variable.importance[c(15:1)], xlab = "importance",
+        horiz = T,las=1,cex.names = 0.7)
+
+# dev.off()
+```
+
+```{r}
+### testing all data
+
+testall = read.csv("preprocess_train.csv")
+sam = read.csv("preprocess_competition_test.csv")
+submi = read.csv("sample_submission.csv")
+testall = testall[,-c(2,4,6,8,9)]
+sam = sam[,-c(1,3,5,7,8)]
+
+treeall = tree(Transported~., data = testall)
+prune_treeall = prune.tree(treeall,best = cv_tree$size[which.min(cv_tree$dev)])
+predall = predict(prune_treeall,newdata = sam)
+
+fit_treeall = predall > 0.5
+
+df = submi %>% mutate(Transported = as.character(fit_treeall))
+
+
+```
+
+```{r}
+# typeof(df$PassengerId)
+```
+
+```{r}
+write.csv(df, "tree_method.csv", row.names = FALSE) 
+```
+
+
+
+```{r}
+library(tidyr)
+library(glue)
+library(xgboost)
+library(caret)
+library(dplyr)
+```
+
+```{r}
+# read the clean data
+# data here are provided by the train data set, and split into train and test
+
+
+# training data split to training data (0.8)
+titanic_training <- training
+# training data split to testing data (0.2)
+titanic_testing <- testing
+
+
+head(titanic_training)
+summary(titanic_training)
+```
+
+
+```{r}
+# drop the PassengerId column
+titanic_training <- titanic_training[, !colnames(titanic_training) %in% "PassengerId", drop = FALSE]
+titanic_testing <- titanic_testing[, !colnames(titanic_testing) %in% "PassengerId", drop = FALSE]
+
+cat("The number of rows in train data is", nrow(titanic_training),
+    ", and the number of columns in train data is", ncol(titanic_training), "\n")
+
+cat("The number of rows in test data is", nrow(titanic_testing),
+    ", and the number of columns in test data is", ncol(titanic_testing), "\n")
+```
+
+
+
+
+```{r}
+y_train <- titanic_training$Transported  # the variable we want to predict
+y_test <- titanic_testing$Transported
+x_train <- titanic_training[, setdiff(names(titanic_training), "Transported")] # exclude the "Transported" column from the predictor variables
+x_test <- titanic_testing[, setdiff(names(titanic_testing), "Transported")]
+
+head(x_train)
+head(y_train)
+```
+
+
+```
+# library(caret)
+set.seed(123) 
+
+# Create indices for train and test sets 1:9
+indices <- createDataPartition(y, p = 0.9, list = FALSE)
+
+x_train <- x[indices, ]
+y_train <- y[indices]
+x_test <- x[-indices, ]
+y_test <- y[-indices]
+
+
+cat("Training set dimensions:", dim(x_train), "\n")
+cat("Test set dimensions:", dim(x_test), "\n")
+
+```
+
+```{r}
+# only consider numeric columns
+numeric_cols <- sapply(x_train, is.numeric)
+
+x_train <- x_train[, numeric_cols]
+x_test <- x_test[, numeric_cols]
+
+```
+
+
+```
+# Standartization
+
+mean_train <- apply(x_train, 2, mean)
+sd_train <- apply(x_train, 2, sd)
+
+# Standardize the training set
+x_train <- scale(x_train, center = mean_train, scale = sd_train)
+
+# Use the same mean and standard deviation to standardize the test set
+x_test <- scale(x_test, center = mean_train, scale = sd_train)
+```
+
+```{r}
+# CV
+# library(caret)
+
+# for cv we need to onvert y_train to a factor with valid variable names
+y_train_cv_use <- factor(y_train, levels = c(0, 1), labels = make.names(c("Class0", "Class1")))
+
+# Create a train control object for cross-validation
+ctrl <- trainControl(method = "cv",  # cross-validation method
+                     number = 3,      # number of folds
+                     summaryFunction = twoClassSummary,  # for binary classification
+                     classProbs = TRUE,  # compute class probabilities
+                     verboseIter = TRUE)  # display iteration information
+
+
+# Create a grid of hyperparameters
+xgb_grid <- expand.grid(
+  nrounds = 500,
+  eta = c(0.1, 0.05),
+  max_depth = c(3, 6),
+  gamma = 0,
+  colsample_bytree = c(0.7, 1),
+  min_child_weight = c(1, 2),
+  subsample = 1
+)
+
+
+# Train the XGBoost model with xgb_grid
+xgb_model <- train(
+  x = x_train,
+  y = y_train_cv_use,
+  method = "xgbTree",  # specify xgboost as the method
+  trControl = ctrl,
+  metric = "LogLoss",  # specify the evaluation metric
+  tuneGrid = xgb_grid  # use the merged grid of hyperparameters
+)
+
+# Print the best model and its parameters
+print(xgb_model)
+# The final values used for the model were nrounds = 500, max_depth = 3, eta = 0.05, gamma = 0, colsample_bytree = 0.7, min_child_weight = 1 and subsample = 1.
+```
+
+
+```{r}
+#  Create DMatrix
+xgb_train <- xgb.DMatrix(data = as.matrix(x_train), label = y_train)
+xgb_test <- xgb.DMatrix(data = as.matrix(x_test), label = y_test)
+# label: outcome or variable that we want to predict
+
+# The final values used for the model were nrounds = 500, max_depth = 3, eta = 0.05, gamma = 0, colsample_bytree = 0.7, min_child_weight = 1 and subsample = 1.
+# Define Default Parameters
+default_param <- list(
+        objective = "binary:logistic", # classification
+        booster = "gbtree",
+        eta = 0.05, # default = 0.3
+        gamma = 0,
+        max_depth = 3, # default=6
+        min_child_weight = 2, # default=1
+        subsample = 1,
+        colsample_bytree = 0.7
+)
+
+# booster: set to "gbtree," tree-based model.
+# eta: The learning rate, controlling the step size during optimization.
+# gamma: Minimum loss reduction required to make a further partition on a leaf node.
+# max_depth: The maximum depth of a tree.
+# min_child_weight: Minimum sum of instance weight (hessian) needed in a child.
+# subsample: The fraction of training data to be used for each boosting round. (1: use all data for each tree.)
+# colsample_bytree: The fraction of features that will be randomly sampled for each tree. (1: use all features for each tree.)
+
+
+
+# Cross-Validation
+xgbcv <- xgb.cv(params=default_param, data=xgb_train, nrounds=800, nfold=5, showsd=T, stratified=T, early_stopping_rounds=10, maximize=F, verbose=2)
+# nrounds: the maximum number of iterations (numbers of tree). 
+# # how many weak learners get added to our ensemble. If we set this parameter too low, we won’t be able to model the complexity of our dataset very well. If we set it too high, we run the risk of overfitting. We always need to be wary of overfitting our model to our training data.
+# # Here we only looking for a decent value for nround
+
+
+# params: A list of parameters for the XGBoost model.
+# data: The training data in xgb.DMatrix format. 
+# nfold: The number of folds in cross-validation, split your training data into n folds or subsets.
+# showsd: If TRUE, the standard deviation of the test metric will be displayed.
+# stratified: If TRUE, the cross-validation is performed using stratified sampling.
+# early_stopping_rounds: If the evaluation metric doesn't improve for early_stopping_rounds consecutive rounds, training will stop.
+# maximize: If TRUE(False), it assumes that the evaluation metric should be maximized;(minimization), obj is minimizing
+```
+
+```{r}
+# plot MSE 
+
+# library(dplyr)
+res_df <- data.frame(TRAINING_ERROR = xgbcv$evaluation_log$train_logloss_mean, 
+                     VALIDATION_ERROR = xgbcv$evaluation_log$test_logloss_mean, # Don't confuse this with the test data set. 
+                     ITERATION = xgbcv$evaluation_log$iter) %>%
+  mutate(MIN = VALIDATION_ERROR == min(VALIDATION_ERROR))
+
+# best iteration
+best_nrounds <- which.min(xgbcv$evaluation_log$test_logloss_mean)
+# best_nrounds <- xgbcv$best_iteration # this also get the best iteration
+
+# library(tidyr)
+res_df_longer <- pivot_longer(data = res_df, 
+                              cols = c(TRAINING_ERROR, VALIDATION_ERROR), 
+                              names_to = "ERROR_TYPE",
+                              values_to = "ERROR")
+
+# library(glue)
+plot_mse <- ggplot(res_df_longer, aes(x = ITERATION)) +        
+  geom_line(aes(y = ERROR, group = ERROR_TYPE, colour = ERROR_TYPE)) +
+  geom_vline(xintercept = best_nrounds, colour = "green") +
+  geom_label(
+    aes(label = glue("${best_nrounds} iterations gives minimum validation error"), y = 0.2, x = best_nrounds, hjust = 0.1)
+  ) +
+  labs(
+    x = "nrounds",
+    y = "Error",
+    title = "Test & Train Errors",
+    subtitle = glue("the training error keeps decreasing after {best_nrounds} iterations, but the validation error starts \ncreeping up. This is a sign of overfitting.")
+  ) +
+  scale_colour_discrete("Error Type: ")
+
+plot_mse
+
+ggsave("plot_mse_xgboost.eps", plot_mse, units = "in")
+```
+
+
+```{r}
+# Once we have the optimal number of rounds, 
+# we use it to train a final XGBoost model (bstSparse) on the entire training set
+
+bstSparse <- xgboost(data=xgb_train, nrounds=best_nrounds, params=default_param)
+
+```
+
+```{r}
+library(Ckmeans.1d.dp)
+# variable importance plot
+mat <- xgb.importance(feature_names=colnames(xgb_train), model=bstSparse)
+xgb.ggplot.importance(importance_matrix=mat, rel_to_first=TRUE)
+```
+
+
+```{r}
+# use the final model to make prediction 
+
+XGBpred <- predict(bstSparse, xgb_test)
+
+y_predictions_01 <- as.numeric(XGBpred > 0.5)  # numerical
+y_predictions_TF <- XGBpred > 0.5  # true / false
+```
+
+
+```{r}
+# measure prediction accuracy of testing set
+
+labels_xgb_test <- as.numeric(getinfo(xgb_test, "label"))  # y_test
+cat("MSE:", mean((labels_xgb_test - y_predictions_01)^2), "\n") # mse
+```
+
+```{r}
+# Confusion Matrix
+
+#library(caret)
+conf_matrix <- confusionMatrix(data = as.factor(y_predictions_01), reference = as.factor(y_test))
+conf_matrix
+```
+
+# Kaggle submission prediction
+
+```{r}
+# make the final model and prediction with entire data
+
+# entire training data 
+titanic_training_whole <- training
+# entire training data
+titanic_testing_whole <- testing
+
+
+PassengerId_testing <- titanic_testing_whole$PassengerId
+
+# drop ID
+titanic_training_whole <- titanic_training_whole[, !colnames(titanic_training_whole) %in% "PassengerId", drop = FALSE]
+titanic_testing_whole <- titanic_testing_whole[, !colnames(titanic_testing_whole) %in% "PassengerId", drop = FALSE]
+
+
+
+y_train_whole <- titanic_training_whole$Transported  # the variable we want to predict
+x_train_whole <- titanic_training_whole[, setdiff(names(titanic_training_whole), "Transported")] # exclude the "Transported" column from the predictor variables
+#x_test_whole <- titanic_testing[, setdiff(names(titanic_testing_whole), "Transported")]
+
+# only consider numeric columns
+numeric_cols <- sapply(x_train_whole, is.numeric)
+x_train_whole <- x_train_whole[, numeric_cols]
+numeric_cols <- sapply(titanic_testing_whole, is.numeric)
+x_test_whole<- titanic_testing_whole[, numeric_cols]
+```
+
+```{r}
+# data dim
+dim(titanic_training_whole)
+dim(titanic_testing_whole)
+```
+
+```{r}
+# we use the entire training set (without spliting to testing) to train the final model
+# so we can make the prediction with the testing data
+
+#  Create DMatrix
+xgb_train_whole <- xgb.DMatrix(data = as.matrix(x_train_whole), label = y_train_whole)
+xgb_test_whole <- xgb.DMatrix(data = as.matrix(x_test_whole))
+# label: outcome or variable that we want to predict
+
+bstSparse <- xgboost(data=xgb_train_whole, nrounds=best_nrounds, params=default_param)
+```
+
+```{r}
+# variable importance plot
+mat <- xgb.importance(feature_names=colnames(xgb_train_whole), model=bstSparse)
+importance_figrue <- xgb.ggplot.importance(importance_matrix=mat, rel_to_first=TRUE)
+importance_figrue
+
+ggsave("plot_importance_xgboost.eps", importance_figrue, units = "in")
+```
+
+```{r}
+# use the final model to make prediction 
+
+XGBpred <- predict(bstSparse, xgb_test_whole)
+
+y_predictions_01 <- as.numeric(XGBpred > 0.5)  # numerical
+y_predictions_TF <- XGBpred > 0.5  # true / false
+```
+
+```{r}
+# Create a data frame of submission
+
+result_df <- data.frame(
+  PassengerId = PassengerId_testing,
+  Transported = y_predictions_TF
+)
+
+head(result_df)
+write.csv(result_df, file = "xgboost_submission.csv", row.names = FALSE)
+```
+
